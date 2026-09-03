@@ -8,7 +8,7 @@
 
 - Windows 10/11 或带桌面会话的 Windows Server
 - Node.js 22 或更高版本
-- PowerShell 7 (`pwsh.exe`)
+- Windows PowerShell 5.1 (`powershell.exe`) 或 PowerShell 7 (`pwsh.exe`)
 - Windows Telnet Client 可选功能
 
 本机尚未安装 Telnet 时，在“管理员”终端中执行：
@@ -39,7 +39,7 @@ npm install
 }
 ```
 
-如果 PowerShell 7 不在默认位置，可加环境变量：
+启动器优先使用 PowerShell 7；未安装时会自动回退到 Windows 自带的 PowerShell 5.1。也可用环境变量显式指定：
 
 ```json
 {
@@ -81,7 +81,7 @@ VS Code 可把同一项放到 `.vscode/mcp.json` 的 `servers` 下，并补上 `
 
 - MCP Server 的 stdout 只用于 JSON-RPC；Telnet 不继承该管道。
 - 每个会话有独立 worker，因此可以并行打开多个 Telnet 窗口。
-- worker 退出不会主动关掉 Telnet，用户仍可手工继续操作；使用 `telnet_close` 才会关闭会话。
+- MCP Server 正常退出、stdio 断开或崩溃导致 worker 收到 EOF 时，会强制回收其启动的 `telnet.exe` 和 `conhost.exe`，避免留下孤儿进程。
 - 读取的是字符屏幕缓冲区，不是 OCR，速度快且不会受窗口遮挡影响。
 - 目前不抓取像素截图，也不支持鼠标事件；Windows Telnet 本身是字符终端，这两项不是必要能力。
 - Telnet 协议通常是明文的。不要通过不可信网络发送密码或敏感数据；有条件时应使用 SSH。
@@ -92,7 +92,7 @@ VS Code 可把同一项放到 `.vscode/mcp.json` 的 `servers` 下，并补上 `
 npm run check
 ```
 
-集成测试会短暂打开一个真正可见的 `cmd.exe` 控制台，验证启动、屏幕读取、键盘输入和关闭的完整链路，但不会连接网络。即使机器未安装 Telnet，该测试也能执行。
+集成测试会分别通过 PowerShell 7 和 Windows PowerShell 5.1 短暂打开真正可见的 `cmd.exe` 控制台，验证启动、屏幕读取、键盘输入和关闭的完整链路，但不会连接网络。即使机器未安装 Telnet，该测试也能执行。
 
 ## 文件结构
 

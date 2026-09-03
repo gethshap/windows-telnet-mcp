@@ -77,6 +77,7 @@ worker 与 Telnet 一对一，是因为一个 Windows 进程同一时间最多�
 
 - conhost 通过 ShellExecute 独立启动，不继承 worker 的 JSON 管道。
 - worker 在 Telnet/console 关闭前先 `FreeConsole`，避免自己收到 `CTRL_CLOSE_EVENT` 后被系统一起终止。
-- 所有 Telnet 参数使用 `ProcessStartInfo.ArgumentList` 逐项传递，不经过 shell 拼接。
+- 所有 Telnet 参数先按 `CommandLineToArgvW` 规则逐项转义，再交给 `ProcessStartInfo.Arguments`，不会把参数当作 shell 命令解析。
+- Windows PowerShell 5.1 没有 `ProcessStartInfo.ArgumentList` 和 `Process.Kill(bool)`；worker 内置等价的 Windows 参数转义，并在旧版 .NET 上回退到 `Process.Kill()`。
 - `telnet_send` 不回显输入内容到工具结果，减少凭据被二次记录的风险。
-- MCP Server 被关闭时只结束 worker，不主动关闭用户可见 Telnet；会话可由用户继续手工操作。
+- MCP Server 正常退出时会先强制关闭全部会话；如果 Node 来不及执行关闭逻辑，worker 在控制管道 EOF 时仍会回收 `telnet.exe` 和 `conhost.exe`，避免孤儿进程。

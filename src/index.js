@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { delimiter, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
 import { McpServer } from '@modelcontextprotocol/server';
@@ -17,7 +17,13 @@ function findPowerShell() {
   if (process.env.TELNET_MCP_PWSH) return process.env.TELNET_MCP_PWSH;
   const common = join(process.env.ProgramFiles || 'C:\\Program Files', 'PowerShell', '7', 'pwsh.exe');
   if (existsSync(common)) return common;
-  return 'pwsh.exe';
+  for (const directory of (process.env.PATH || '').split(delimiter)) {
+    const cleanDirectory = directory.replace(/^"|"$/g, '');
+    if (cleanDirectory && existsSync(join(cleanDirectory, 'pwsh.exe'))) return join(cleanDirectory, 'pwsh.exe');
+  }
+  const windowsPowerShell = join(systemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+  if (existsSync(windowsPowerShell)) return windowsPowerShell;
+  return 'powershell.exe';
 }
 
 const powerShellPath = findPowerShell();
@@ -181,8 +187,19 @@ class SessionManager {
     return result;
   }
 
-  stopWorkers() {
-    for (const session of this.sessions.values()) session.worker.stop();
+  async closeAll() {
+    const sessions = [...this.sessions.values()];
+    await Promise.allSettled(sessions.map(async (session) => {
+      try {
+        await session.worker.request('close', {
+          force: true,
+          escapeCharacter: session.escapeCharacter,
+        }, 8_000);
+      } finally {
+        session.worker.stop();
+        this.sessions.delete(session.id);
+      }
+    }));
   }
 }
 
@@ -409,10 +426,18 @@ const stdio = serveStdio(buildServer, {
   },
 });
 
-async function shutdown() {
-  manager.stopWorkers();
-  await stdio.close();
+let shutdownPromise;
+
+function shutdown() {
+  if (!shutdownPromise) {
+    shutdownPromise = (async () => {
+      await manager.closeAll();
+      await stdio.close();
+    })();
+  }
+  return shutdownPromise;
 }
 
 process.once('SIGINT', () => shutdown().finally(() => process.exit(0)));
 process.once('SIGTERM', () => shutdown().finally(() => process.exit(0)));
+process.stdin.once('end', () => void shutdown());

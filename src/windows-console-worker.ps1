@@ -1,5 +1,12 @@
 $ErrorActionPreference = 'Stop'
 
+# Windows PowerShell 5.1 otherwise uses the active OEM code page for redirected
+# Console.In/Out. MCP JSON is UTF-8, and Telnet screens may contain non-ASCII
+# text, so pin both sides of the worker protocol before attaching a console.
+$utf8NoBom = New-Object Text.UTF8Encoding($false)
+[Console]::InputEncoding = $utf8NoBom
+[Console]::OutputEncoding = $utf8NoBom
+
 # This worker is intentionally windowless. It owns API handles for exactly one
 # visible console session; conhost.exe and telnet.exe remain ordinary desktop
 # processes that the user can see and operate at the same time.
@@ -351,6 +358,38 @@ function Send-NamedKey([string]$key) {
     Write-KeyRecords $records
 }
 
+function ConvertTo-WindowsCommandLineArgument([string]$value) {
+    # ProcessStartInfo.ArgumentList only exists on modern .NET. This implements
+    # the CommandLineToArgvW quoting rules so the same code is safe on Windows
+    # PowerShell 5.1 (.NET Framework) and PowerShell 7+.
+    if ($null -eq $value -or $value.Length -eq 0) { return '""' }
+    if ($value -notmatch '[\s"]') { return $value }
+
+    $builder = New-Object Text.StringBuilder
+    [void]$builder.Append('"')
+    $backslashes = 0
+    foreach ($character in $value.ToCharArray()) {
+        if ($character -eq [char]'\') {
+            $backslashes++
+            continue
+        }
+        if ($character -eq [char]'"') {
+            [void]$builder.Append(('\' * (($backslashes * 2) + 1)))
+            [void]$builder.Append('"')
+            $backslashes = 0
+            continue
+        }
+        if ($backslashes -gt 0) {
+            [void]$builder.Append(('\' * $backslashes))
+            $backslashes = 0
+        }
+        [void]$builder.Append($character)
+    }
+    if ($backslashes -gt 0) { [void]$builder.Append(('\' * ($backslashes * 2))) }
+    [void]$builder.Append('"')
+    return $builder.ToString()
+}
+
 function Start-VisibleClient([object]$request) {
     if ($script:clientPid -ne 0) { throw 'This worker already owns a console session.' }
 
@@ -375,8 +414,12 @@ function Start-VisibleClient([object]$request) {
     # sequences can corrupt the MCP protocol stream.
     $startInfo.UseShellExecute = $true
     $startInfo.CreateNoWindow = $false
-    $startInfo.ArgumentList.Add($clientPath)
-    foreach ($arg in $arguments) { $startInfo.ArgumentList.Add($arg) }
+    $quotedArguments = [Collections.Generic.List[string]]::new()
+    $quotedArguments.Add((ConvertTo-WindowsCommandLineArgument $clientPath))
+    foreach ($arg in $arguments) {
+        $quotedArguments.Add((ConvertTo-WindowsCommandLineArgument ([string]$arg)))
+    }
+    $startInfo.Arguments = [string]::Join(' ', $quotedArguments)
 
     $script:hostProcess = [Diagnostics.Process]::Start($startInfo)
     if ($null -eq $script:hostProcess) { throw 'Failed to start conhost.exe.' }
@@ -439,7 +482,17 @@ function Stop-Session([bool]$force, [string]$escapeCharacter) {
     if ($window -ne [IntPtr]::Zero) {
         [void][ConsoleNative]::PostMessageW($window, [ConsoleNative]::WM_CLOSE, [IntPtr]::Zero, [IntPtr]::Zero)
     }
-    if (-not $process.WaitForExit(1500)) { $process.Kill($true); [void]$process.WaitForExit(1500) }
+    if (-not $process.WaitForExit(1500)) {
+        $killTree = $process.GetType().GetMethod('Kill', [type[]]@([bool]))
+        if ($null -ne $killTree) {
+            [void]$killTree.Invoke($process, [object[]]@($true))
+        } else {
+            # Windows PowerShell 5.1 exposes only Process.Kill(). The console
+            # client is the direct child and conhost exits with it.
+            $process.Kill()
+        }
+        [void]$process.WaitForExit(1500)
+    }
     return [ordered]@{ closed = $process.HasExited; forced = $true }
 }
 
@@ -500,4 +553,14 @@ while ($true) {
     }
 }
 
+# EOF means the MCP parent closed or crashed. Reap the visible session here as
+# a second line of defence, even if Node did not get a chance to call close.
+try {
+    if ($script:clientPid -ne 0 -and $null -ne (Get-Process -Id $script:clientPid -ErrorAction SilentlyContinue)) {
+        [void](Stop-Session $true '')
+    }
+} catch {
+    # The control pipe is already closed, so there is nowhere useful to report
+    # cleanup errors. Close handles below and let Windows release the console.
+}
 Close-ConsoleHandles
