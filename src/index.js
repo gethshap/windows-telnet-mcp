@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
-import { delimiter, dirname, join } from 'node:path';
+import { delimiter, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
 import { McpServer } from '@modelcontextprotocol/server';
@@ -28,21 +28,24 @@ function findPowerShell() {
 
 const powerShellPath = findPowerShell();
 
-class WorkerClient {
-  constructor() {
+export class WorkerClient {
+  constructor({ executable = powerShellPath, scriptPath = workerPath } = {}) {
     this.nextId = 1;
     this.pending = new Map();
     this.buffer = '';
     this.stderr = '';
     this.exited = false;
-    this.process = spawn(powerShellPath, [
+    this.stopping = false;
+    this.closed = new Promise((resolveClosed) => { this.resolveClosed = resolveClosed; });
+    this.process = spawn(executable, [
       '-NoLogo',
       '-NoProfile',
       '-NonInteractive',
       '-ExecutionPolicy',
       'Bypass',
       '-File',
-      workerPath,
+      scriptPath,
+      '-ParentProcessId', String(process.pid),
     ], {
       stdio: ['pipe', 'pipe', 'pipe'],
       windowsHide: true,
@@ -54,13 +57,18 @@ class WorkerClient {
     this.process.stderr.on('data', (chunk) => {
       this.stderr = (this.stderr + chunk).slice(-16_384);
     });
+    this.process.stdin.on('error', (error) => this.#failAll(error));
     this.process.on('error', (error) => this.#failAll(error));
-    this.process.on('exit', (code, signal) => {
+    this.process.on('exit', () => { this.exited = true; });
+    // Wait for stdout to drain before rejecting requests: a final close reply
+    // can arrive immediately before the worker exits.
+    this.process.on('close', (code, signal) => {
       this.exited = true;
       const detail = this.stderr.trim();
       this.#failAll(new Error(
         `Windows console worker exited (code=${code}, signal=${signal}).${detail ? ` ${detail}` : ''}`,
       ));
+      this.resolveClosed();
     });
   }
 
@@ -97,7 +105,7 @@ class WorkerClient {
   }
 
   request(op, payload = {}, timeoutMs = 15_000) {
-    if (this.exited) return Promise.reject(new Error('Windows console worker is not running.'));
+    if (this.exited || this.stopping) return Promise.reject(new Error('Windows console worker is not running.'));
     const id = this.nextId++;
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -115,27 +123,47 @@ class WorkerClient {
   }
 
   stop() {
-    if (this.exited) return;
+    if (this.stopPromise) return this.stopPromise;
+    this.stopping = true;
+    if (this.exited) return this.closed;
     this.process.stdin.end();
-    setTimeout(() => {
+    const timer = setTimeout(() => {
       if (!this.exited) this.process.kill();
     }, 500).unref();
+    // The worker owns a kill-on-close Job Object before it creates any console
+    // process. Forced worker termination therefore also reaps that process tree.
+    this.stopPromise = this.closed.finally(() => clearTimeout(timer));
+    return this.stopPromise;
   }
 }
 
-class SessionManager {
-  constructor() {
+export class SessionManager {
+  constructor({ createWorker = () => new WorkerClient() } = {}) {
     this.sessions = new Map();
+    this.workers = new Set();
+    this.createWorker = createWorker;
+    this.closing = false;
+    this.closePromise = null;
   }
 
   async start(options) {
-    const worker = new WorkerClient();
+    if (this.closing) throw new Error('The Telnet session manager is shutting down.');
+    const worker = this.createWorker();
     const id = randomUUID();
+    // Include launching workers in shutdown, not just successfully started ones.
+    this.workers.add(worker);
+    void worker.closed.then(() => {
+      this.workers.delete(worker);
+      this.sessions.delete(id);
+    });
     try {
       const result = await worker.request('launch', {
         clientArgs: buildTelnetArguments(options),
         title: options.title,
       }, 20_000);
+      if (this.closing || worker.exited || worker.stopping) {
+        throw new Error('The Telnet session was closed during startup.');
+      }
       this.sessions.set(id, {
         id,
         worker,
@@ -146,7 +174,7 @@ class SessionManager {
       });
       return this.publicSession(this.sessions.get(id));
     } catch (error) {
-      worker.stop();
+      await worker.stop();
       throw error;
     }
   }
@@ -176,30 +204,31 @@ class SessionManager {
 
   async close(id, force) {
     const session = this.get(id);
-    const result = await session.worker.request('close', {
-      force,
-      escapeCharacter: session.escapeCharacter,
-    }, 8_000);
-    if (result.closed) {
-      session.worker.stop();
-      this.sessions.delete(id);
+    try {
+      const result = await session.worker.request('close', {
+        force,
+        escapeCharacter: session.escapeCharacter,
+      }, 8_000);
+      if (result.closed) {
+        await session.worker.stop();
+        this.sessions.delete(id);
+      }
+      return result;
+    } finally {
+      // Even a timed-out force-close must not leave an unusable live session.
+      if (force) {
+        await session.worker.stop();
+        this.sessions.delete(id);
+      }
     }
-    return result;
   }
 
-  async closeAll() {
-    const sessions = [...this.sessions.values()];
-    await Promise.allSettled(sessions.map(async (session) => {
-      try {
-        await session.worker.request('close', {
-          force: true,
-          escapeCharacter: session.escapeCharacter,
-        }, 8_000);
-      } finally {
-        session.worker.stop();
-        this.sessions.delete(session.id);
-      }
-    }));
+  closeAll() {
+    if (this.closePromise) return this.closePromise;
+    this.closing = true;
+    this.closePromise = Promise.allSettled([...this.workers].map((worker) => worker.stop()))
+      .then(() => { this.sessions.clear(); });
+    return this.closePromise;
   }
 }
 
@@ -419,25 +448,28 @@ function buildServer() {
   return server;
 }
 
-const stdio = serveStdio(buildServer, {
-  legacy: 'serve',
-  onerror(error) {
-    console.error(`[windows-telnet-mcp] ${error.stack || error.message}`);
-  },
-});
+// Importing the lifecycle classes for regression tests must not start stdio.
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  const stdio = serveStdio(buildServer, {
+    legacy: 'serve',
+    onerror(error) {
+      console.error(`[windows-telnet-mcp] ${error.stack || error.message}`);
+    },
+  });
 
-let shutdownPromise;
+  let shutdownPromise;
 
-function shutdown() {
-  if (!shutdownPromise) {
-    shutdownPromise = (async () => {
-      await manager.closeAll();
-      await stdio.close();
-    })();
+  function shutdown() {
+    if (!shutdownPromise) {
+      shutdownPromise = (async () => {
+        await manager.closeAll();
+        await stdio.close();
+      })();
+    }
+    return shutdownPromise;
   }
-  return shutdownPromise;
-}
 
-process.once('SIGINT', () => shutdown().finally(() => process.exit(0)));
-process.once('SIGTERM', () => shutdown().finally(() => process.exit(0)));
-process.stdin.once('end', () => void shutdown());
+  process.once('SIGINT', () => shutdown().finally(() => process.exit(0)));
+  process.once('SIGTERM', () => shutdown().finally(() => process.exit(0)));
+  process.stdin.once('end', () => void shutdown());
+}

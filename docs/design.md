@@ -75,9 +75,20 @@ worker 与 Telnet 一对一，是因为一个 Windows 进程同一时间最多�
 
 ## 已处理的 Windows 边界
 
-- conhost 通过 ShellExecute 独立启动，不继承 worker 的 JSON 管道。
+- worker 先把自己加入设置 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` 的 Job Object，再通过 `CreateProcessW` 显式启动 conhost。子进程从创建时就继承 Job 成员关系，避免“创建后再加入 Job”之间的清理竞态。唯一 Job 句柄不允许继承，由 worker 持有到进程结束；即使 worker 被强杀，系统也会回收其进程树。
+- conhost 使用 `DETACHED_PROCESS`，且 `bInheritHandles=false`，不继承 worker 的控制台、JSON 管道或 Job 句柄。conhost 自己创建用户可见的桌面控制台，并用 `IsWindowVisible` 验证可见性。
 - worker 在 Telnet/console 关闭前先 `FreeConsole`，避免自己收到 `CTRL_CLOSE_EVENT` 后被系统一起终止。
-- 所有 Telnet 参数先按 `CommandLineToArgvW` 规则逐项转义，再交给 `ProcessStartInfo.Arguments`，不会把参数当作 shell 命令解析。
+- 所有 Telnet 参数先按 Windows 命令行规则逐项转义，再交给 `CreateProcessW`，不会把参数当作 shell 命令解析。
 - Windows PowerShell 5.1 没有 `ProcessStartInfo.ArgumentList` 和 `Process.Kill(bool)`；worker 内置等价的 Windows 参数转义，并在旧版 .NET 上回退到 `Process.Kill()`。
 - `telnet_send` 不回显输入内容到工具结果，减少凭据被二次记录的风险。
-- MCP Server 正常退出时会先强制关闭全部会话；如果 Node 来不及执行关闭逻辑，worker 在控制管道 EOF 时仍会回收 `telnet.exe` 和 `conhost.exe`，避免孤儿进程。
+- MCP Server 从创建 worker 开始就追踪生命周期。关闭流程幂等，拒绝新会话，向包括启动中会话在内的全部 worker 发送 EOF，并等待退出；超过 500 ms 会终止 worker，由 Job Object 兜底回收。
+- worker 用独立的 CLR 线程等待 MCP 父进程句柄，父进程突然终止时即使 PowerShell 主线程忙碌，也会终止 worker 并触发 Job 回收。父进程和客户端均保留进程句柄，避免依据已复用的 PID 误操作其他进程。
+- 控制管道读取放在 CLR 后台任务，主循环每 100 ms 检查客户端是否退出；客户端自行退出后，worker 释放控制台、结束进程，Node 自动移除会话。正常 `close` 的回复先写出再退出，避免丢失关闭结果。
+- 读屏使用 `[Out] char[]` 接收定长本机缓冲区，按 API 返回的实际字符数构造字符串，不依赖 `StringBuilder` 的 NUL 终止假设，兼容 PowerShell 5.1 的 .NET Framework 封送行为。
+
+生命周期相关 Win32 文档：
+
+- <https://learn.microsoft.com/en-us/windows/win32/procthread/job-objects>
+- <https://learn.microsoft.com/en-us/windows/win32/api/jobapi2/nf-jobapi2-assignprocesstojobobject>
+- <https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-createprocessw>
+- <https://learn.microsoft.com/en-us/windows/console/readconsoleoutputcharacter>

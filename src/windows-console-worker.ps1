@@ -1,3 +1,5 @@
+param([int]$ParentProcessId = 0)
+
 $ErrorActionPreference = 'Stop'
 
 # Windows PowerShell 5.1 otherwise uses the active OEM code page for redirected
@@ -14,8 +16,45 @@ $utf8NoBom = New-Object Text.UTF8Encoding($false)
 $nativeSource = @'
 using System;
 using System.Collections.Generic;
+using System.ComponentModel;
+using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
+
+[StructLayout(LayoutKind.Sequential)]
+public struct JobBasicLimits {
+    public long ProcessTime, JobTime;
+    public uint Flags;
+    public UIntPtr MinimumWorkingSet, MaximumWorkingSet;
+    public uint ActiveProcesses;
+    public UIntPtr Affinity;
+    public uint PriorityClass, SchedulingClass;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+public struct JobExtendedLimits {
+    public JobBasicLimits Basic;
+    public ulong ReadOperations, WriteOperations, OtherOperations;
+    public ulong ReadBytes, WriteBytes, OtherBytes;
+    public UIntPtr ProcessMemory, JobMemory, PeakProcessMemory, PeakJobMemory;
+}
+
+[StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+public struct StartupInfo {
+    public uint Size;
+    public string Reserved, Desktop, Title;
+    public uint X, Y, Width, Height, Columns, Rows, FillAttribute, Flags;
+    public ushort ShowWindow, ReservedSize;
+    public IntPtr ReservedPointer, Input, Output, Error;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+public struct ProcessInformation {
+    public IntPtr Process, Thread;
+    public uint ProcessId, ThreadId;
+}
 
 [StructLayout(LayoutKind.Sequential)]
 public struct Coord {
@@ -72,6 +111,87 @@ public struct ProcessEntry32 {
 }
 
 public static class ConsoleNative {
+    // The worker is itself in this job BEFORE CreateProcess runs. Descendants
+    // inherit membership atomically, so there is no create-then-assign gap.
+    // Do not close this sole, non-inheritable handle while the worker is alive:
+    // process exit (including TerminateProcess) closes it and kills the job.
+    private static IntPtr lifetimeJob;
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern IntPtr CreateJobObjectW(IntPtr security, string name);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool SetInformationJobObject(IntPtr job, int infoClass,
+        ref JobExtendedLimits info, uint length);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
+
+    [DllImport("kernel32.dll")]
+    private static extern IntPtr GetCurrentProcess();
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr OpenProcess(uint access, bool inherit, uint processId);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern uint WaitForSingleObject(IntPtr handle, uint milliseconds);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern bool CreateProcessW(string application, StringBuilder commandLine,
+        IntPtr processSecurity, IntPtr threadSecurity, bool inheritHandles, uint flags,
+        IntPtr environment, string directory, ref StartupInfo startup,
+        out ProcessInformation process);
+
+    public static void InitializeLifetime(int parentPid) {
+        lifetimeJob = CreateJobObjectW(IntPtr.Zero, null);
+        if (lifetimeJob == IntPtr.Zero) throw new Win32Exception(Marshal.GetLastWin32Error());
+        var limits = new JobExtendedLimits();
+        limits.Basic.Flags = 0x00002000; // JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        if (!SetInformationJobObject(lifetimeJob, 9, ref limits,
+                (uint)Marshal.SizeOf(typeof(JobExtendedLimits))) ||
+            !AssignProcessToJobObject(lifetimeJob, GetCurrentProcess())) {
+            int error = Marshal.GetLastWin32Error();
+            CloseHandle(lifetimeJob);
+            lifetimeJob = IntPtr.Zero;
+            throw new Win32Exception(error, "Cannot establish console process lifetime ownership.");
+        }
+        if (parentPid > 0) {
+            // A native wait remains responsive even while PowerShell is busy or
+            // its control pipe is stalled. Retain a handle, never poll a reused PID.
+            IntPtr parent = OpenProcess(0x00100000, false, (uint)parentPid);
+            if (parent == IntPtr.Zero) throw new Win32Exception(Marshal.GetLastWin32Error());
+            var watcher = new Thread(delegate() {
+                try {
+                    if (WaitForSingleObject(parent, 0xFFFFFFFF) == 0) Environment.Exit(0);
+                } finally { CloseHandle(parent); }
+            });
+            watcher.IsBackground = true;
+            watcher.Start();
+        }
+    }
+
+    public static Process StartConsoleHost(string path, string arguments) {
+        if (lifetimeJob == IntPtr.Zero) throw new InvalidOperationException("No lifetime job.");
+        var startup = new StartupInfo();
+        startup.Size = (uint)Marshal.SizeOf(typeof(StartupInfo));
+        ProcessInformation child;
+        // DETACHED_PROCESS separates conhost from the worker's console/stdio.
+        // Explicit conhost creates the visible desktop console for its client.
+        // No handles (especially the job handle or JSON pipes) are inherited.
+        var commandLine = new StringBuilder("\"" + path + "\" " + arguments);
+        if (!CreateProcessW(path, commandLine, IntPtr.Zero, IntPtr.Zero, false,
+                0x00000008, IntPtr.Zero, null, ref startup, out child))
+            throw new Win32Exception(Marshal.GetLastWin32Error());
+        try { return Process.GetProcessById((int)child.ProcessId); }
+        finally { CloseHandle(child.Thread); CloseHandle(child.Process); }
+    }
+
+    public static Task<string> ReadProtocolLine() {
+        // Calling TextReader.ReadLineAsync on the synchronized .NET Framework
+        // Console.In can still block the caller. Run the read on a CLR thread.
+        return Task.Factory.StartNew(delegate { return Console.In.ReadLine(); });
+    }
+
     public const uint GENERIC_READ = 0x80000000;
     public const uint GENERIC_WRITE = 0x40000000;
     public const uint FILE_SHARE_READ = 0x00000001;
@@ -103,7 +223,7 @@ public static class ConsoleNative {
     public static extern bool GetConsoleScreenBufferInfo(IntPtr output, out ConsoleScreenBufferInfo info);
 
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-    public static extern bool ReadConsoleOutputCharacterW(IntPtr output, StringBuilder text,
+    public static extern bool ReadConsoleOutputCharacterW(IntPtr output, [Out] char[] text,
         uint length, Coord coord, out uint read);
 
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
@@ -118,6 +238,9 @@ public static class ConsoleNative {
 
     [DllImport("user32.dll")]
     public static extern bool IsWindow(IntPtr window);
+
+    [DllImport("user32.dll")]
+    public static extern bool IsWindowVisible(IntPtr window);
 
     [DllImport("user32.dll")]
     public static extern bool ShowWindow(IntPtr window, int command);
@@ -179,8 +302,10 @@ public static class ConsoleNative {
 '@
 
 Add-Type -TypeDefinition $nativeSource -Language CSharp
+[ConsoleNative]::InitializeLifetime($ParentProcessId)
 
 $script:hostProcess = $null
+$script:clientProcess = $null
 $script:clientPid = 0
 $script:inputHandle = [IntPtr]::Zero
 $script:outputHandle = [IntPtr]::Zero
@@ -201,8 +326,9 @@ function Get-Win32Error([string]$operation) {
 
 function Assert-Session {
     if ($script:clientPid -eq 0) { throw 'No console client is attached.' }
-    $process = Get-Process -Id $script:clientPid -ErrorAction SilentlyContinue
-    if ($null -eq $process) { throw "Console client process $($script:clientPid) has exited." }
+    if ($null -eq $script:clientProcess -or $script:clientProcess.HasExited) {
+        throw "Console client process $($script:clientPid) has exited."
+    }
 }
 
 function Open-ConsoleHandles([int]$processId) {
@@ -261,14 +387,14 @@ function Read-Screen([int]$rows, [string]$mode) {
     $width = [Math]::Max(1, $right - $left + 1)
     $lines = [Collections.Generic.List[string]]::new()
     for ($y = $top; $y -le $bottom; $y++) {
-        $builder = [Text.StringBuilder]::new($width)
+        $characters = New-Object char[] $width
         [uint32]$read = 0
         $coord = [Coord]::new([int16]$left, [int16]$y)
         if (-not [ConsoleNative]::ReadConsoleOutputCharacterW(
-            $script:outputHandle, $builder, [uint32]$width, $coord, [ref]$read)) {
+            $script:outputHandle, $characters, [uint32]$width, $coord, [ref]$read)) {
             throw (Get-Win32Error 'ReadConsoleOutputCharacterW')
         }
-        $line = $builder.ToString().TrimEnd([char]0, [char]' ')
+        $line = [string]::new($characters, 0, [int]$read).TrimEnd([char]0, [char]' ')
         $lines.Add($line)
     }
     while ($lines.Count -gt 0 -and $lines[$lines.Count - 1].Length -eq 0) {
@@ -407,21 +533,13 @@ function Start-VisibleClient([object]$request) {
     }
     $script:sessionTitle = if ($request.title) { [string]$request.title } else { 'MCP Windows Telnet' }
 
-    $startInfo = [Diagnostics.ProcessStartInfo]::new()
-    $startInfo.FileName = $conhostPath
-    # ShellExecute gives conhost a desktop launch with no inheritance from the
-    # worker's JSON stdio pipes. Without this separation, terminal VT control
-    # sequences can corrupt the MCP protocol stream.
-    $startInfo.UseShellExecute = $true
-    $startInfo.CreateNoWindow = $false
     $quotedArguments = [Collections.Generic.List[string]]::new()
     $quotedArguments.Add((ConvertTo-WindowsCommandLineArgument $clientPath))
     foreach ($arg in $arguments) {
         $quotedArguments.Add((ConvertTo-WindowsCommandLineArgument ([string]$arg)))
     }
-    $startInfo.Arguments = [string]::Join(' ', $quotedArguments)
-
-    $script:hostProcess = [Diagnostics.Process]::Start($startInfo)
+    $script:hostProcess = [ConsoleNative]::StartConsoleHost(
+        $conhostPath, [string]::Join(' ', $quotedArguments))
     if ($null -eq $script:hostProcess) { throw 'Failed to start conhost.exe.' }
 
     $leafName = [IO.Path]::GetFileName($clientPath)
@@ -434,6 +552,10 @@ function Start-VisibleClient([object]$request) {
     if ($script:clientPid -eq 0) {
         throw "The visible console opened, but its $leafName child process could not be located."
     }
+    $script:clientProcess = Get-Process -Id $script:clientPid
+    # Open and retain the process handle now, so an exited PID cannot be reused
+    # by an unrelated process during status checks or cleanup.
+    [void]$script:clientProcess.Handle
 
     Open-ConsoleHandles $script:clientPid
     if (-not [ConsoleNative]::SetConsoleTitleW($script:sessionTitle)) {
@@ -450,15 +572,18 @@ function Start-VisibleClient([object]$request) {
         consoleHostPid = $script:hostProcess.Id
         windowHandle = $script:windowHandle.ToInt64()
         title = $script:sessionTitle
-        visible = ($script:windowHandle -ne [IntPtr]::Zero -and [ConsoleNative]::IsWindow($script:windowHandle))
+        visible = ($script:windowHandle -ne [IntPtr]::Zero -and [ConsoleNative]::IsWindowVisible($script:windowHandle))
         screen = $screen
     }
 }
 
 function Stop-Session([bool]$force, [string]$escapeCharacter) {
     if ($script:clientPid -eq 0) { return [ordered]@{ closed = $true; alreadyExited = $true } }
-    $process = Get-Process -Id $script:clientPid -ErrorAction SilentlyContinue
-    if ($null -eq $process) { return [ordered]@{ closed = $true; alreadyExited = $true } }
+    $process = $script:clientProcess
+    if ($null -eq $process -or $process.HasExited) {
+        Close-ConsoleHandles
+        return [ordered]@{ closed = $true; alreadyExited = $true }
+    }
 
     if (-not $force) {
         if ([string]::IsNullOrEmpty($escapeCharacter)) {
@@ -496,71 +621,86 @@ function Stop-Session([bool]$force, [string]$escapeCharacter) {
     return [ordered]@{ closed = $process.HasExited; forced = $true }
 }
 
-while ($true) {
-    $line = [Console]::In.ReadLine()
-    if ($null -eq $line) { break }
-    if ([string]::IsNullOrWhiteSpace($line)) { continue }
-    $id = $null
-    try {
-        $request = $line | ConvertFrom-Json
-        $id = $request.id
-        switch ([string]$request.op) {
-            'launch' {
-                $result = Start-VisibleClient $request
-            }
-            'read' {
-                $rows = if ($request.rows) { [int]$request.rows } else { 40 }
-                $mode = if ($request.mode) { [string]$request.mode } else { 'visible' }
-                $result = Read-Screen $rows $mode
-            }
-            'sendText' {
-                Assert-Session
-                foreach ($character in ([string]$request.text).ToCharArray()) { Send-Character $character }
-                if ([bool]$request.appendEnter) { Send-NamedKey 'ENTER' }
-                $result = [ordered]@{ sent = ([string]$request.text).Length; enterSent = [bool]$request.appendEnter }
-            }
-            'sendKey' {
-                Send-NamedKey ([string]$request.key)
-                $result = [ordered]@{ keySent = [string]$request.key }
-            }
-            'focus' {
-                Assert-Session
-                if ($script:windowHandle -eq [IntPtr]::Zero -or -not [ConsoleNative]::IsWindow($script:windowHandle)) {
-                    throw 'The console does not expose a visible top-level window handle.'
-                }
-                [void][ConsoleNative]::ShowWindow($script:windowHandle, [ConsoleNative]::SW_RESTORE)
-                $focused = [ConsoleNative]::SetForegroundWindow($script:windowHandle)
-                $result = [ordered]@{ focused = $focused; windowHandle = $script:windowHandle.ToInt64() }
-            }
-            'status' {
-                $process = if ($script:clientPid) { Get-Process -Id $script:clientPid -ErrorAction SilentlyContinue } else { $null }
-                $result = [ordered]@{
-                    running = ($null -ne $process)
-                    clientPid = $script:clientPid
-                    consoleHostPid = if ($script:hostProcess) { $script:hostProcess.Id } else { 0 }
-                    windowHandle = $script:windowHandle.ToInt64()
-                    title = $script:sessionTitle
-                }
-            }
-            'close' {
-                $result = Stop-Session ([bool]$request.force) ([string]$request.escapeCharacter)
-            }
-            default { throw "Unknown worker operation '$($request.op)'." }
-        }
-        Write-Reply ([ordered]@{ id = $id; ok = $true; result = $result })
-    } catch {
-        Write-Reply ([ordered]@{ id = $id; ok = $false; error = $_.Exception.Message })
-    }
-}
-
-# EOF means the MCP parent closed or crashed. Reap the visible session here as
-# a second line of defence, even if Node did not get a chance to call close.
 try {
-    if ($script:clientPid -ne 0 -and $null -ne (Get-Process -Id $script:clientPid -ErrorAction SilentlyContinue)) {
-        [void](Stop-Session $true '')
+    :requests while ($true) {
+        $lineTask = [ConsoleNative]::ReadProtocolLine()
+        while (-not $lineTask.Wait(100)) {
+            if ($null -ne $script:clientProcess -and $script:clientProcess.HasExited) {
+                break requests
+            }
+        }
+        $line = $lineTask.GetAwaiter().GetResult()
+        if ($null -eq $line) { break }
+        if ([string]::IsNullOrWhiteSpace($line)) { continue }
+        $id = $null
+        $request = $null
+        try {
+            $request = $line | ConvertFrom-Json
+            $id = $request.id
+            switch ([string]$request.op) {
+                'launch' {
+                    $result = Start-VisibleClient $request
+                }
+                'read' {
+                    $rows = if ($request.rows) { [int]$request.rows } else { 40 }
+                    $mode = if ($request.mode) { [string]$request.mode } else { 'visible' }
+                    $result = Read-Screen $rows $mode
+                }
+                'sendText' {
+                    Assert-Session
+                    foreach ($character in ([string]$request.text).ToCharArray()) { Send-Character $character }
+                    if ([bool]$request.appendEnter) { Send-NamedKey 'ENTER' }
+                    $result = [ordered]@{ sent = ([string]$request.text).Length; enterSent = [bool]$request.appendEnter }
+                }
+                'sendKey' {
+                    Send-NamedKey ([string]$request.key)
+                    $result = [ordered]@{ keySent = [string]$request.key }
+                }
+                'focus' {
+                    Assert-Session
+                    if ($script:windowHandle -eq [IntPtr]::Zero -or -not [ConsoleNative]::IsWindow($script:windowHandle)) {
+                        throw 'The console does not expose a visible top-level window handle.'
+                    }
+                    [void][ConsoleNative]::ShowWindow($script:windowHandle, [ConsoleNative]::SW_RESTORE)
+                    $focused = [ConsoleNative]::SetForegroundWindow($script:windowHandle)
+                    $result = [ordered]@{ focused = $focused; windowHandle = $script:windowHandle.ToInt64() }
+                }
+                'status' {
+                    $process = $script:clientProcess
+                    $result = [ordered]@{
+                        running = ($null -ne $process -and -not $process.HasExited)
+                        clientPid = $script:clientPid
+                        consoleHostPid = if ($script:hostProcess) { $script:hostProcess.Id } else { 0 }
+                        windowHandle = $script:windowHandle.ToInt64()
+                        title = $script:sessionTitle
+                    }
+                }
+                'close' {
+                    $result = Stop-Session ([bool]$request.force) ([string]$request.escapeCharacter)
+                }
+                default { throw "Unknown worker operation '$($request.op)'." }
+            }
+            Write-Reply ([ordered]@{ id = $id; ok = $true; result = $result })
+            if ($request.op -eq 'close' -and $result.closed) { break }
+        } catch {
+            Write-Reply ([ordered]@{ id = $id; ok = $false; error = $_.Exception.Message })
+            # A partially launched console must not outlive a failed launch.
+            if ($null -ne $request -and $request.op -eq 'launch') { break }
+        }
+        if ($null -ne $script:clientProcess -and $script:clientProcess.HasExited) { break }
     }
-} catch {
-    # The control pipe is already closed, so there is nowhere useful to report
-    # cleanup errors. Close handles below and let Windows release the console.
+} finally {
+    # Release console handles on EOF, client exit and failed protocol writes alike.
+    # The job is the final backstop, including failures before client discovery.
+    try {
+        if ($null -ne $script:clientProcess -and -not $script:clientProcess.HasExited) {
+            [void](Stop-Session $true '')
+        }
+    } catch {
+        # The control pipe is already closed, so there is nowhere useful to report
+        # cleanup errors. Close handles below and let Windows release the console.
+    }
+    Close-ConsoleHandles
+    if ($null -ne $script:clientProcess) { $script:clientProcess.Dispose() }
+    if ($null -ne $script:hostProcess) { $script:hostProcess.Dispose() }
 }
-Close-ConsoleHandles
